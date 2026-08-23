@@ -1,0 +1,135 @@
+name: Build Quest3 V4 APK
+
+"on":
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Init submodules
+        run: git submodule update --init --recursive
+
+      - name: Patch Quest 3 renderer
+        shell: python
+        run: |
+          from pathlib import Path
+
+          p = Path(
+              "app/src/main/java/io/github/miuzarte/"
+              "scrcpyforandroid/pages/FullscreenControlScreen.kt"
+          )
+
+          s = p.read_text(encoding="utf-8")
+
+          # Add graphicsLayer import
+          import_line = "import androidx.compose.ui.geometry.Offset"
+
+          if "import androidx.compose.ui.graphics.graphicsLayer" not in s:
+              if import_line not in s:
+                  raise SystemExit("geometry Offset import not found")
+
+              s = s.replace(
+                  import_line,
+                  import_line
+                  + "\nimport androidx.compose.ui.graphics.graphicsLayer",
+                  1
+              )
+
+          # Find actual video Surface in whatever formatting this revision uses
+          marker = "ScrcpyVideoSurface("
+
+          surface_pos = s.find(marker)
+
+          if surface_pos < 0:
+              raise SystemExit("ScrcpyVideoSurface not found")
+
+          fill_pos = s.find(".fillMaxSize()", surface_pos)
+
+          if fill_pos < 0:
+              raise SystemExit("fillMaxSize after ScrcpyVideoSurface not found")
+
+          # Safety: do not accidentally modify something hundreds of lines later
+          if fill_pos - surface_pos > 1000:
+              raise SystemExit("Unexpected ScrcpyVideoSurface layout")
+
+          old = ".fillMaxSize()"
+
+          new = """.fillMaxSize()
+                      .graphicsLayer {
+                          // Quest 3:
+                          // keep full 4128x2208 framebuffer on headset,
+                          // select/straighten right eye only on phone.
+                          rotationZ = -22f
+                          scaleX = 1.82f
+                          scaleY = 1.82f
+                          translationX = -size.width * 0.46f
+                      }"""
+
+          s = s[:fill_pos] + new + s[fill_pos + len(old):]
+
+          p.write_text(s, encoding="utf-8")
+
+          print("QUEST3 V4 PATCH APPLIED")
+          print("Surface position:", surface_pos)
+          print("fillMaxSize position:", fill_pos)
+          print("rotation = -22")
+          print("scale = 1.82")
+          print("right eye shift = -0.46 width")
+          print("server-side crop = OFF")
+
+      - name: Verify patch
+        run: |
+          FILE="app/src/main/java/io/github/miuzarte/scrcpyforandroid/pages/FullscreenControlScreen.kt"
+
+          echo "=== Quest patch ==="
+
+          grep -n "rotationZ = -22f" "$FILE"
+          grep -n "scaleX = 1.82f" "$FILE"
+          grep -n "translationX = -size.width" "$FILE"
+
+          echo "=== Video block ==="
+
+          grep -n -A30 -B5 "ScrcpyVideoSurface(" "$FILE" | head -50
+
+      - name: Make Gradle executable
+        run: chmod +x gradlew
+
+      - name: Build APK
+        run: ./gradlew assembleDebug
+
+      - name: Prepare APK
+        run: |
+          echo "Searching APK..."
+
+          find app/build/outputs -type f -name "*.apk" -print
+
+          APK="$(find app/build/outputs -type f -name "*debug*.apk" | head -n 1)"
+
+          if [ -z "$APK" ]; then
+            echo "APK NOT FOUND"
+            exit 1
+          fi
+
+          cp "$APK" Quest3-ScrcpyForAndroid-V4.apk
+
+          ls -lh Quest3-ScrcpyForAndroid-V4.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Quest3-ScrcpyForAndroid-V4
+          path: Quest3-ScrcpyForAndroid-V4.apk
+          if-no-files-found: error
