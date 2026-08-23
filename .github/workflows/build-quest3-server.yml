@@ -1,0 +1,75 @@
+name: Build Quest3 scrcpy-server
+
+"on":
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Checkout scrcpy 4.1
+        run: |
+          git clone --depth 1 --branch v4.1 https://github.com/Genymobile/scrcpy.git scrcpy-src
+
+      - name: Patch Quest 3 defaults
+        shell: python
+        run: |
+          from pathlib import Path
+
+          p = Path("scrcpy-src/server/src/main/java/com/genymobile/scrcpy/Options.java")
+          s = p.read_text(encoding="utf-8")
+
+          replacements = {
+              "private boolean audio = true;":
+                  "private boolean audio = false;",
+              "private int maxSize;":
+                  "private int maxSize = 1080;",
+              "private int videoBitRate = 8000000;":
+                  "private int videoBitRate = 20000000;",
+              "private float maxFps;":
+                  "private float maxFps = 60f;",
+              "private Rect crop;":
+                  "private Rect crop = new Rect(2064, 0, 4128, 2208);",
+          }
+
+          for old, new in replacements.items():
+              if old not in s:
+                  raise SystemExit(f"Expected line not found: {old}")
+              s = s.replace(old, new, 1)
+
+          p.write_text(s, encoding="utf-8")
+
+          print("Quest 3 defaults applied:")
+          print(" crop=2064:2208:2064:0")
+          print(" max_size=1080")
+          print(" max_fps=60")
+          print(" video_bit_rate=20000000")
+          print(" audio=false")
+
+      - name: Build scrcpy-server
+        working-directory: scrcpy-src
+        run: |
+          chmod +x release/build_server.sh
+          release/build_server.sh
+
+      - name: Prepare artifact
+        run: |
+          cp scrcpy-src/release/work/build-server/server/scrcpy-server Quest3-scrcpy-server-v4.1
+          ls -lh Quest3-scrcpy-server-v4.1
+
+      - name: Upload Quest 3 server
+        uses: actions/upload-artifact@v4
+        with:
+          name: Quest3-scrcpy-server-v4.1
+          path: Quest3-scrcpy-server-v4.1
+          if-no-files-found: error
