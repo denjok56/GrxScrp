@@ -1,0 +1,156 @@
+name: Build Quest3 Client-Crop APK
+
+"on":
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Init submodules
+        run: git submodule update --init --recursive
+
+      - name: Patch Quest 3 client-side eye crop
+        shell: python
+        run: |
+          from pathlib import Path
+
+          p = Path("app/src/main/java/io/github/miuzarte/scrcpyforandroid/pages/FullscreenControlScreen.kt")
+          s = p.read_text(encoding="utf-8")
+
+          anchor = "import androidx.compose.ui.geometry.Offset\n"
+          if "import androidx.compose.ui.draw.clipToBounds\n" not in s:
+              if anchor not in s:
+                  raise SystemExit("Import anchor not found")
+              s = s.replace(
+                  anchor,
+                  anchor
+                  + "import androidx.compose.ui.draw.clipToBounds\n"
+                  + "import androidx.compose.ui.graphics.graphicsLayer\n",
+                  1,
+              )
+
+          old = '''        val sessionAspect =
+              if (session.height == 0) 16f / 9f
+              else session.width.toFloat() / session.height.toFloat()
+          Box(
+              modifier = Modifier
+                  .align(Alignment.Center)
+                  .then(
+                      if (sessionAspect > (maxWidth.value / maxHeight.value))
+                          Modifier
+                              .fillMaxWidth()
+                              .aspectRatio(sessionAspect)
+                      else
+                          Modifier
+                              .fillMaxHeight()
+                              .aspectRatio(sessionAspect),
+                  ),
+          ) {
+              ScrcpyVideoSurface(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .onGloballyPositioned { coordinates ->
+                          val bounds = coordinates.boundsInWindow()
+                          onVideoBoundsInWindowChanged(
+                              Rect(
+                                  bounds.left.toInt(),
+                                  bounds.top.toInt(),
+                                  bounds.right.toInt(),
+                                  bounds.bottom.toInt(),
+                              ),
+                          )
+                      },
+                  session = session,
+                  imeRequestToken = imeRequestToken,
+                  onImeCommitText = onImeCommitText,
+'''
+
+          new = '''        // Quest 3 client-side view:
+          // Keep the full 4128x2208 stream from the headset (no server crop),
+          // clip the right 2064x2208 half locally, then correct the ~22° eye tilt.
+          val questEyeAspect = 2064f / 2208f
+
+          Box(
+              modifier = Modifier
+                  .align(Alignment.Center)
+                  .fillMaxSize()
+                  .clipToBounds(),
+              contentAlignment = Alignment.Center,
+          ) {
+              Box(
+                  modifier = Modifier
+                      .fillMaxHeight(0.98f)
+                      .aspectRatio(questEyeAspect)
+                      .graphicsLayer {
+                          rotationZ = -22f
+                          scaleX = 0.78f
+                          scaleY = 0.78f
+                      }
+                      .clipToBounds(),
+              ) {
+                  ScrcpyVideoSurface(
+                      modifier = Modifier
+                          .align(Alignment.CenterEnd)
+                          .requiredWidth(maxWidth * 2)
+                          .fillMaxHeight()
+                          .onGloballyPositioned { coordinates ->
+                              val bounds = coordinates.boundsInWindow()
+                              onVideoBoundsInWindowChanged(
+                                  Rect(
+                                      bounds.left.toInt(),
+                                      bounds.top.toInt(),
+                                      bounds.right.toInt(),
+                                      bounds.bottom.toInt(),
+                                  ),
+                              )
+                          },
+                      session = session,
+                      imeRequestToken = imeRequestToken,
+                      onImeCommitText = onImeCommitText,
+'''
+
+          if old not in s:
+              raise SystemExit("Target video-layout block not found; upstream changed")
+
+          s = s.replace(old, new, 1)
+          p.write_text(s, encoding="utf-8")
+
+          print("Quest 3 renderer installed")
+
+      - name: Verify patch
+        run: |
+          grep -n "Quest 3 client-side view" app/src/main/java/io/github/miuzarte/scrcpyforandroid/pages/FullscreenControlScreen.kt
+          grep -n "requiredWidth(maxWidth \* 2)" app/src/main/java/io/github/miuzarte/scrcpyforandroid/pages/FullscreenControlScreen.kt
+
+      - name: Make Gradle executable
+        run: chmod +x gradlew
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug
+
+      - name: Find and rename APK
+        run: |
+          APK="$(find app/build/outputs/apk -type f -name '*debug*.apk' | head -n 1)"
+          test -n "$APK"
+          cp "$APK" Quest3-ScrcpyForAndroid-client-crop.apk
+          ls -lh Quest3-ScrcpyForAndroid-client-crop.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Quest3-ScrcpyForAndroid-APK
+          path: Quest3-ScrcpyForAndroid-client-crop.apk
+          if-no-files-found: error
