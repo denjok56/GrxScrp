@@ -1,4 +1,4 @@
-name: Build Quest3 V3 APK
+name: Build Quest3 V4 APK
 
 "on":
   workflow_dispatch:
@@ -34,83 +34,75 @@ jobs:
 
           s = p.read_text(encoding="utf-8")
 
-          # Add graphics transform import
-          anchor = "import androidx.compose.ui.geometry.Offset\n"
+          # Add graphicsLayer import
+          import_line = "import androidx.compose.ui.geometry.Offset"
 
-          if "import androidx.compose.ui.graphics.graphicsLayer\n" not in s:
-              if anchor not in s:
-                  raise SystemExit("IMPORT ANCHOR NOT FOUND")
+          if "import androidx.compose.ui.graphics.graphicsLayer" not in s:
+              if import_line not in s:
+                  raise SystemExit("geometry Offset import not found")
 
               s = s.replace(
-                  anchor,
-                  anchor + "import androidx.compose.ui.graphics.graphicsLayer\n",
+                  import_line,
+                  import_line
+                  + "\nimport androidx.compose.ui.graphics.graphicsLayer",
                   1
               )
 
-          # Exact block from current upstream
-          old = """            ScrcpyVideoSurface(
-                  modifier = Modifier
-                      .fillMaxSize()
-                      .onGloballyPositioned { coordinates ->
-                          val bounds = coordinates.boundsInWindow()
-                          onVideoBoundsInWindowChanged(
-                              Rect(
-                                  bounds.left.toInt(),
-                                  bounds.top.toInt(),
-                                  bounds.right.toInt(),
-                                  bounds.bottom.toInt(),
-                              ),
-                          )
-                      },"""
+          # Find actual video Surface in whatever formatting this revision uses
+          marker = "ScrcpyVideoSurface("
 
-          new = """            ScrcpyVideoSurface(
-                  modifier = Modifier
-                      .fillMaxSize()
+          surface_pos = s.find(marker)
+
+          if surface_pos < 0:
+              raise SystemExit("ScrcpyVideoSurface not found")
+
+          fill_pos = s.find(".fillMaxSize()", surface_pos)
+
+          if fill_pos < 0:
+              raise SystemExit("fillMaxSize after ScrcpyVideoSurface not found")
+
+          # Safety: do not accidentally modify something hundreds of lines later
+          if fill_pos - surface_pos > 1000:
+              raise SystemExit("Unexpected ScrcpyVideoSurface layout")
+
+          old = ".fillMaxSize()"
+
+          new = """.fillMaxSize()
                       .graphicsLayer {
-                          // Quest 3 eye correction.
-                          // Keep full framebuffer on Quest:
-                          // no server-side crop = no crop flicker.
+                          // Quest 3:
+                          // keep full 4128x2208 framebuffer on headset,
+                          // select/straighten right eye only on phone.
                           rotationZ = -22f
+                          scaleX = 1.82f
+                          scaleY = 1.82f
+                          translationX = -size.width * 0.46f
+                      }"""
 
-                          // Scale full stereo frame so the right eye fills
-                          // most of the viewport. Translation shifts
-                          // the right half into view.
-                          scaleX = 1.75f
-                          scaleY = 1.75f
-                          translationX = -size.width * 0.44f
-                      }
-                      .onGloballyPositioned { coordinates ->
-                          val bounds = coordinates.boundsInWindow()
-                          onVideoBoundsInWindowChanged(
-                              Rect(
-                                  bounds.left.toInt(),
-                                  bounds.top.toInt(),
-                                  bounds.right.toInt(),
-                                  bounds.bottom.toInt(),
-                              ),
-                          )
-                      },"""
-
-          if old not in s:
-              raise SystemExit("CURRENT VIDEO BLOCK NOT FOUND")
-
-          s = s.replace(old, new, 1)
+          s = s[:fill_pos] + new + s[fill_pos + len(old):]
 
           p.write_text(s, encoding="utf-8")
 
-          print("QUEST3 V3 PATCH APPLIED")
-          print("server crop: OFF")
-          print("rotation: -22")
-          print("client scale: 1.75")
-          print("right-eye translation enabled")
+          print("QUEST3 V4 PATCH APPLIED")
+          print("Surface position:", surface_pos)
+          print("fillMaxSize position:", fill_pos)
+          print("rotation = -22")
+          print("scale = 1.82")
+          print("right eye shift = -0.46 width")
+          print("server-side crop = OFF")
 
       - name: Verify patch
         run: |
           FILE="app/src/main/java/io/github/miuzarte/scrcpyforandroid/pages/FullscreenControlScreen.kt"
 
+          echo "=== Quest patch ==="
+
           grep -n "rotationZ = -22f" "$FILE"
-          grep -n "scaleX = 1.75f" "$FILE"
+          grep -n "scaleX = 1.82f" "$FILE"
           grep -n "translationX = -size.width" "$FILE"
+
+          echo "=== Video block ==="
+
+          grep -n -A30 -B5 "ScrcpyVideoSurface(" "$FILE" | head -50
 
       - name: Make Gradle executable
         run: chmod +x gradlew
@@ -120,7 +112,7 @@ jobs:
 
       - name: Prepare APK
         run: |
-          echo "Searching for APK..."
+          echo "Searching APK..."
 
           find app/build/outputs -type f -name "*.apk" -print
 
@@ -131,13 +123,13 @@ jobs:
             exit 1
           fi
 
-          cp "$APK" Quest3-ScrcpyForAndroid-V3.apk
+          cp "$APK" Quest3-ScrcpyForAndroid-V4.apk
 
-          ls -lh Quest3-ScrcpyForAndroid-V3.apk
+          ls -lh Quest3-ScrcpyForAndroid-V4.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Quest3-ScrcpyForAndroid-V3
-          path: Quest3-ScrcpyForAndroid-V3.apk
+          name: Quest3-ScrcpyForAndroid-V4
+          path: Quest3-ScrcpyForAndroid-V4.apk
           if-no-files-found: error
