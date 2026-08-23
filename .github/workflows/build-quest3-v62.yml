@@ -192,3 +192,601 @@ jobs:
                       event,
                   )
               }
+
+              override fun onCreateInputConnection(
+                  outAttrs: EditorInfo,
+              ): InputConnection? {
+
+                  if (!commitTextEnabled) {
+                      return super
+                          .onCreateInputConnection(outAttrs)
+                  }
+
+                  outAttrs.inputType =
+                      InputType.TYPE_CLASS_TEXT
+
+                  outAttrs.imeOptions =
+                      EditorInfo.IME_FLAG_NO_EXTRACT_UI
+
+                  return object :
+                      BaseInputConnection(
+                          this,
+                          false,
+                      ) {
+
+                      override fun commitText(
+                          text: CharSequence,
+                          newCursorPosition: Int,
+                      ): Boolean {
+
+                          if (
+                              inputCallbacks
+                                  ?.handleCommitText(text) == true
+                          ) {
+                              return true
+                          }
+
+                          return super.commitText(
+                              text,
+                              newCursorPosition,
+                          )
+                      }
+
+                      override fun deleteSurroundingText(
+                          beforeLength: Int,
+                          afterLength: Int,
+                      ): Boolean {
+
+                          if (
+                              inputCallbacks
+                                  ?.handleDeleteSurroundingText(
+                                      beforeLength,
+                                      afterLength,
+                                  ) == true
+                          ) {
+                              return true
+                          }
+
+                          return super
+                              .deleteSurroundingText(
+                                  beforeLength,
+                                  afterLength,
+                              )
+                      }
+
+                      override fun sendKeyEvent(
+                          event: KeyEvent,
+                      ): Boolean {
+
+                          if (
+                              event.keyCode ==
+                              KeyEvent.KEYCODE_BACK
+                          ) {
+                              return super
+                                  .sendKeyEvent(event)
+                          }
+
+                          if (
+                              inputCallbacks
+                                  ?.handleKeyEvent(event) == true
+                          ) {
+                              return true
+                          }
+
+                          return super.sendKeyEvent(event)
+                      }
+                  }
+              }
+          }
+          KOTLIN
+
+      - name: Patch video output to TextureView
+        shell: python
+        run: |
+          from pathlib import Path
+
+          p = Path(
+              "app/src/main/java/io/github/miuzarte/"
+              "scrcpyforandroid/widgets/DeviceWidgets.kt"
+          )
+
+          s = p.read_text(encoding="utf-8")
+
+          s = s.replace(
+              "import android.view.SurfaceHolder",
+              "import android.graphics.SurfaceTexture\n"
+              "import android.view.TextureView",
+              1,
+          )
+
+          start_marker = (
+              "@Composable\n"
+              "fun ScrcpyVideoSurface("
+          )
+
+          end_marker = (
+              "\n@Composable\n"
+              "internal fun DeviceTile("
+          )
+
+          start = s.find(start_marker)
+          end = s.find(end_marker, start)
+
+          if start < 0:
+              raise SystemExit(
+                  "ScrcpyVideoSurface start not found"
+              )
+
+          if end < 0:
+              raise SystemExit(
+                  "ScrcpyVideoSurface end not found"
+              )
+
+          lines = [
+              "@Composable",
+              "fun ScrcpyVideoSurface(",
+              "    modifier: Modifier,",
+              "    session: Scrcpy.Session.SessionInfo?,",
+              "    imeRequestToken: Int = 0,",
+              "    onImeCommitText: (suspend (String) -> Unit)? = null,",
+              "    onImeDeleteSurroundingText: (suspend (beforeLength: Int, afterLength: Int) -> Unit)? = null,",
+              "    onImeKeyEvent: (suspend (KeyEvent) -> Boolean)? = null,",
+              ") {",
+              "    val taskScope = remember { CoroutineScope(SupervisorJob() + Dispatchers.IO) }",
+              "    val scope = rememberCoroutineScope()",
+              "    val imeInputMutex = remember { Mutex() }",
+              "    val lifecycleOwner = LocalLifecycleOwner.current",
+              "",
+              "    var currentSurface by remember {",
+              "        mutableStateOf<Surface?>(null)",
+              "    }",
+              "",
+              "    var currentTextureView by remember {",
+              "        mutableStateOf<ScrcpyInputSurfaceView?>(null)",
+              "    }",
+              "",
+              "    val latestSession by rememberUpdatedState(session)",
+              "",
+              "    fun configureTexture(",
+              "        view: ScrcpyInputSurfaceView",
+              "    ) {",
+              "        val info = latestSession",
+              "        val texture = view.surfaceTexture",
+              "",
+              "        if (",
+              "            info != null &&",
+              "            texture != null &&",
+              "            info.width > 0 &&",
+              "            info.height > 0",
+              "        ) {",
+              "            texture.setDefaultBufferSize(",
+              "                info.width,",
+              "                info.height,",
+              "            )",
+              "        }",
+              "",
+              "        view.applyQuest3Transform()",
+              "    }",
+              "",
+              "    LaunchedEffect(",
+              "        session,",
+              "        currentSurface,",
+              "    ) {",
+              "        val surface =",
+              "            currentSurface",
+              "                ?: return@LaunchedEffect",
+              "",
+              "        if (",
+              "            session != null &&",
+              "            surface.isValid",
+              "        ) {",
+              "            NativeCoreFacade",
+              "                .attachVideoSurface(surface)",
+              "        }",
+              "    }",
+              "",
+              "    LaunchedEffect(",
+              "        session?.width,",
+              "        session?.height,",
+              "        currentTextureView,",
+              "    ) {",
+              "        currentTextureView",
+              "            ?.let { configureTexture(it) }",
+              "    }",
+              "",
+              "    LaunchedEffect(",
+              "        imeRequestToken,",
+              "        currentTextureView,",
+              "    ) {",
+              "        if (imeRequestToken == 0) {",
+              "            return@LaunchedEffect",
+              "        }",
+              "",
+              "        val view =",
+              "            currentTextureView",
+              "                ?: return@LaunchedEffect",
+              "",
+              "        view.setCommitTextEnabled(true)",
+              "        LocalInputService.showSoftKeyboard(view)",
+              "    }",
+              "",
+              "    DisposableEffect(",
+              "        lifecycleOwner,",
+              "        session,",
+              "        currentSurface,",
+              "    ) {",
+              "        val observer =",
+              "            LifecycleEventObserver { _, event ->",
+              "                if (event == Lifecycle.Event.ON_START) {",
+              "                    val surface = currentSurface",
+              "",
+              "                    if (",
+              "                        session != null &&",
+              "                        surface != null &&",
+              "                        surface.isValid",
+              "                    ) {",
+              "                        scope.launch {",
+              "                            NativeCoreFacade",
+              "                                .attachVideoSurface(surface)",
+              "                        }",
+              "                    }",
+              "                }",
+              "            }",
+              "",
+              "        lifecycleOwner.lifecycle",
+              "            .addObserver(observer)",
+              "",
+              "        onDispose {",
+              "            lifecycleOwner.lifecycle",
+              "                .removeObserver(observer)",
+              "        }",
+              "    }",
+              "",
+              "    DisposableEffect(Unit) {",
+              "        onDispose {",
+              "            val surface = currentSurface",
+              "",
+              "            if (surface != null) {",
+              "                taskScope.launch {",
+              "                    NativeCoreFacade",
+              "                        .detachVideoSurface(surface)",
+              "                    surface.release()",
+              "                }",
+              "            }",
+              "        }",
+              "    }",
+              "",
+              "    AndroidView(",
+              "        modifier = modifier,",
+              "",
+              "        factory = { context ->",
+              "            ScrcpyInputSurfaceView(context).apply {",
+              "                currentTextureView = this",
+              "",
+              "                inputCallbacks =",
+              "                    object :",
+              "                        ScrcpyInputSurfaceView.InputCallbacks {",
+              "",
+              "                        override fun handleKeyEvent(",
+              "                            event: KeyEvent,",
+              "                        ): Boolean {",
+              "                            val handler =",
+              "                                onImeKeyEvent",
+              "                                    ?: return false",
+              "",
+              "                            taskScope.launch {",
+              "                                imeInputMutex.withLock {",
+              "                                    handler(event)",
+              "                                }",
+              "                            }",
+              "",
+              "                            return true",
+              "                        }",
+              "",
+              "                        override fun handleCommitText(",
+              "                            text: CharSequence,",
+              "                        ): Boolean {",
+              "                            val handler =",
+              "                                onImeCommitText",
+              "                                    ?: return false",
+              "",
+              "                            taskScope.launch {",
+              "                                imeInputMutex.withLock {",
+              "                                    handler(text.toString())",
+              "                                }",
+              "                            }",
+              "",
+              "                            return true",
+              "                        }",
+              "",
+              "                        override fun handleDeleteSurroundingText(",
+              "                            beforeLength: Int,",
+              "                            afterLength: Int,",
+              "                        ): Boolean {",
+              "                            val handler =",
+              "                                onImeDeleteSurroundingText",
+              "                                    ?: return false",
+              "",
+              "                            taskScope.launch {",
+              "                                imeInputMutex.withLock {",
+              "                                    handler(",
+              "                                        beforeLength,",
+              "                                        afterLength,",
+              "                                    )",
+              "                                }",
+              "                            }",
+              "",
+              "                            return true",
+              "                        }",
+              "                    }",
+              "",
+              "                surfaceTextureListener =",
+              "                    object :",
+              "                        TextureView.SurfaceTextureListener {",
+              "",
+              "                        override fun onSurfaceTextureAvailable(",
+              "                            surfaceTexture: SurfaceTexture,",
+              "                            width: Int,",
+              "                            height: Int,",
+              "                        ) {",
+              "                            latestSession?.let { info ->",
+              "                                if (",
+              "                                    info.width > 0 &&",
+              "                                    info.height > 0",
+              "                                ) {",
+              "                                    surfaceTexture",
+              "                                        .setDefaultBufferSize(",
+              "                                            info.width,",
+              "                                            info.height,",
+              "                                        )",
+              "                                }",
+              "                            }",
+              "",
+              "                            applyQuest3Transform()",
+              "",
+              "                            val newSurface =",
+              "                                Surface(surfaceTexture)",
+              "",
+              "                            currentSurface = newSurface",
+              "",
+              "                            if (latestSession != null) {",
+              "                                scope.launch {",
+              "                                    NativeCoreFacade",
+              "                                        .attachVideoSurface(",
+              "                                            newSurface",
+              "                                        )",
+              "                                }",
+              "                            }",
+              "                        }",
+              "",
+              "                        override fun onSurfaceTextureSizeChanged(",
+              "                            surfaceTexture: SurfaceTexture,",
+              "                            width: Int,",
+              "                            height: Int,",
+              "                        ) {",
+              "                            applyQuest3Transform()",
+              "                        }",
+              "",
+              "                        override fun onSurfaceTextureDestroyed(",
+              "                            surfaceTexture: SurfaceTexture,",
+              "                        ): Boolean {",
+              "                            val surface = currentSurface",
+              "",
+              "                            if (surface != null) {",
+              "                                taskScope.launch {",
+              "                                    NativeCoreFacade",
+              "                                        .detachVideoSurface(surface)",
+              "                                    surface.release()",
+              "                                }",
+              "",
+              "                                currentSurface = null",
+              "                            }",
+              "",
+              "                            return true",
+              "                        }",
+              "",
+              "                        override fun onSurfaceTextureUpdated(",
+              "                            surfaceTexture: SurfaceTexture,",
+              "                        ) = Unit",
+              "                    }",
+              "            }",
+              "        },",
+              "",
+              "        update = { view ->",
+              "            configureTexture(view)",
+              "        },",
+              "    )",
+              "}",
+          ]
+
+          replacement = "\n".join(lines)
+
+          s = s[:start] + replacement + s[end:]
+
+          p.write_text(
+              s,
+              encoding="utf-8",
+          )
+
+          print(
+              "Quest TextureView renderer installed"
+          )
+
+      - name: Patch SideQuest aspect ratios
+        shell: python
+        run: |
+          from pathlib import Path
+
+          # ---------- Preview ----------
+          p = Path(
+              "app/src/main/java/io/github/miuzarte/"
+              "scrcpyforandroid/widgets/DeviceWidgets.kt"
+          )
+
+          s = p.read_text(encoding="utf-8")
+
+          preview_fn = s.find(
+              "internal fun PreviewCard("
+          )
+
+          preview_start = s.find(
+              "                val sessionAspect =",
+              preview_fn,
+          )
+
+          preview_end = s.find(
+              "                val containerAspect =",
+              preview_start,
+          )
+
+          if preview_fn < 0:
+              raise SystemExit(
+                  "PreviewCard not found"
+              )
+
+          if preview_start < 0:
+              raise SystemExit(
+                  "Preview sessionAspect start not found"
+              )
+
+          if preview_end < 0:
+              raise SystemExit(
+                  "Preview sessionAspect end not found"
+              )
+
+          s = (
+              s[:preview_start]
+              + "                val sessionAspect = 1778f / 1039f\n"
+              + s[preview_end:]
+          )
+
+          p.write_text(
+              s,
+              encoding="utf-8",
+          )
+
+          print(
+              "Preview aspect patched"
+          )
+
+          # ---------- Fullscreen ----------
+          p = Path(
+              "app/src/main/java/io/github/miuzarte/"
+              "scrcpyforandroid/pages/FullscreenControlScreen.kt"
+          )
+
+          s = p.read_text(encoding="utf-8")
+
+          fullscreen_fn = s.find(
+              "fun FullscreenControlPage("
+          )
+
+          fullscreen_start = s.find(
+              "        val sessionAspect =",
+              fullscreen_fn,
+          )
+
+          fullscreen_end = s.find(
+              "        Box(",
+              fullscreen_start,
+          )
+
+          if fullscreen_fn < 0:
+              raise SystemExit(
+                  "FullscreenControlPage not found"
+              )
+
+          if fullscreen_start < 0:
+              raise SystemExit(
+                  "Fullscreen sessionAspect start not found"
+              )
+
+          if fullscreen_end < 0:
+              raise SystemExit(
+                  "Fullscreen sessionAspect end not found"
+              )
+
+          s = (
+              s[:fullscreen_start]
+              + "        val sessionAspect = 1778f / 1039f\n"
+              + s[fullscreen_end:]
+          )
+
+          p.write_text(
+              s,
+              encoding="utf-8",
+          )
+
+          print(
+              "Fullscreen aspect patched"
+          )
+
+      - name: Verify V6.2 patch
+        run: |
+          echo "=== Quest crop ==="
+
+          grep -n "cropX = 2200f" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/widgets/ScrcpyInputSurfaceView.kt
+
+          grep -n "cropY = 549f" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/widgets/ScrcpyInputSurfaceView.kt
+
+          grep -n "cropW = 1778f" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/widgets/ScrcpyInputSurfaceView.kt
+
+          grep -n "cropH = 1039f" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/widgets/ScrcpyInputSurfaceView.kt
+
+          echo "=== Quest angle ==="
+
+          grep -n "angleDegrees = -23f" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/widgets/ScrcpyInputSurfaceView.kt
+
+          echo "=== Preview aspect ==="
+
+          grep -n "sessionAspect = 1778f / 1039f" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/widgets/DeviceWidgets.kt
+
+          echo "=== Fullscreen aspect ==="
+
+          grep -n "sessionAspect = 1778f / 1039f" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/pages/FullscreenControlScreen.kt
+
+          echo "=== TextureView ==="
+
+          grep -n "TextureView.SurfaceTextureListener" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/widgets/DeviceWidgets.kt
+
+      - name: Make Gradle executable
+        run: chmod +x gradlew
+
+      - name: Build APK
+        run: ./gradlew assembleDebug
+
+      - name: Prepare APK
+        run: |
+          APK="$(
+            find app/build/outputs \
+              -type f \
+              -name "*debug*.apk" \
+              | head -n 1
+          )"
+
+          if [ -z "$APK" ]; then
+            echo "APK NOT FOUND"
+            exit 1
+          fi
+
+          cp \
+            "$APK" \
+            Quest3-ScrcpyForAndroid-V62.apk
+
+          ls -lh \
+            Quest3-ScrcpyForAndroid-V62.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Quest3-ScrcpyForAndroid-V62
+          path: Quest3-ScrcpyForAndroid-V62.apk
+          if-no-files-found: error
