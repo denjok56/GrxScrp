@@ -1,0 +1,194 @@
+name: Build Quest3 V6.2 SideQuest View APK
+
+"on":
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Init submodules
+        run: git submodule update --init --recursive
+
+      - name: Replace SurfaceView with Quest TextureView
+        run: |
+          cat > app/src/main/java/io/github/miuzarte/scrcpyforandroid/widgets/ScrcpyInputSurfaceView.kt <<'KOTLIN'
+          package io.github.miuzarte.scrcpyforandroid.widgets
+
+          import android.content.Context
+          import android.graphics.Matrix
+          import android.text.InputType
+          import android.util.AttributeSet
+          import android.view.KeyEvent
+          import android.view.TextureView
+          import android.view.inputmethod.BaseInputConnection
+          import android.view.inputmethod.EditorInfo
+          import android.view.inputmethod.InputConnection
+          import kotlin.math.cos
+          import kotlin.math.sin
+
+          class ScrcpyInputSurfaceView @JvmOverloads constructor(
+              context: Context,
+              attrs: AttributeSet? = null,
+              defStyleAttr: Int = 0,
+          ) : TextureView(context, attrs, defStyleAttr) {
+
+              interface InputCallbacks {
+                  fun handleKeyEvent(event: KeyEvent): Boolean
+                  fun handleCommitText(text: CharSequence): Boolean
+                  fun handleDeleteSurroundingText(
+                      beforeLength: Int,
+                      afterLength: Int,
+                  ): Boolean
+              }
+
+              var inputCallbacks: InputCallbacks? = null
+              private var commitTextEnabled = false
+
+              fun setCommitTextEnabled(enabled: Boolean) {
+                  commitTextEnabled = enabled
+                  isFocusable = enabled
+                  isFocusableInTouchMode = enabled
+
+                  if (enabled) requestFocus()
+                  else clearFocus()
+              }
+
+              fun applyQuest3Transform() {
+                  if (width <= 0 || height <= 0) return
+
+                  val viewW = width.toFloat()
+                  val viewH = height.toFloat()
+
+                  // Full Quest 3 framebuffer
+                  val sourceW = 4128f
+                  val sourceH = 2208f
+
+                  // SideQuest-style crop
+                  val cropX = 2200f
+                  val cropY = 549f
+                  val cropW = 1778f
+                  val cropH = 1039f
+
+                  // SideQuest-style tilt correction
+                  val angleDegrees = -23f
+
+                  val cropCenterX = cropX + cropW / 2f
+                  val cropCenterY = cropY + cropH / 2f
+
+                  // Convert crop center from source coordinates
+                  // to TextureView coordinates.
+                  val centerX = cropCenterX / sourceW * viewW
+                  val centerY = cropCenterY / sourceH * viewH
+
+                  // Scale selected crop to fill the TextureView.
+                  val scaleX = sourceW / cropW
+                  val scaleY = sourceH / cropH
+
+                  val radians =
+                      Math.toRadians(angleDegrees.toDouble())
+
+                  val c = cos(radians).toFloat()
+                  val s = sin(radians).toFloat()
+
+                  /*
+                   * One affine transform over the FULL decoded texture:
+                   *
+                   * - selects crop 1778x1039 at 2200,549
+                   * - rotates -23 degrees
+                   * - fits crop into the TextureView
+                   *
+                   * Because the full 4128x2208 texture remains available,
+                   * rotation can pull pixels from outside the nominal crop
+                   * instead of immediately creating black triangles.
+                   */
+
+                  val a = c * scaleX
+                  val b = -s * scaleY
+                  val d = s * scaleX
+                  val e = c * scaleY
+
+                  val tx =
+                      viewW / 2f -
+                          a * centerX -
+                          b * centerY
+
+                  val ty =
+                      viewH / 2f -
+                          d * centerX -
+                          e * centerY
+
+                  val matrix = Matrix()
+
+                  matrix.setValues(
+                      floatArrayOf(
+                          a, b, tx,
+                          d, e, ty,
+                          0f, 0f, 1f,
+                      )
+                  )
+
+                  setOpaque(false)
+                  setTransform(matrix)
+              }
+
+              override fun onSizeChanged(
+                  w: Int,
+                  h: Int,
+                  oldw: Int,
+                  oldh: Int,
+              ) {
+                  super.onSizeChanged(
+                      w,
+                      h,
+                      oldw,
+                      oldh,
+                  )
+
+                  if (w > 0 && h > 0) {
+                      post {
+                          applyQuest3Transform()
+                      }
+                  }
+              }
+
+              override fun onCheckIsTextEditor(): Boolean {
+                  return commitTextEnabled ||
+                      super.onCheckIsTextEditor()
+              }
+
+              override fun onKeyPreIme(
+                  keyCode: Int,
+                  event: KeyEvent,
+              ): Boolean {
+                  if (keyCode == KeyEvent.KEYCODE_BACK) {
+                      return super.onKeyPreIme(
+                          keyCode,
+                          event,
+                      )
+                  }
+
+                  if (
+                      inputCallbacks
+                          ?.handleKeyEvent(event) == true
+                  ) {
+                      return true
+                  }
+
+                  return super.onKeyPreIme(
+                      keyCode,
+                      event,
+                  )
+              }
