@@ -1,4 +1,4 @@
-name: Build Quest3 Client Crop APK
+name: Build Quest3 V2 APK
 
 "on":
   workflow_dispatch:
@@ -34,39 +34,36 @@ jobs:
 
           text = path.read_text(encoding="utf-8")
 
-          # Imports needed for local clipping + rotation.
-          import_anchor = "import androidx.compose.ui.geometry.Offset"
+          # Imports
+          anchor = "import androidx.compose.ui.geometry.Offset"
 
           if "import androidx.compose.ui.draw.clipToBounds" not in text:
-              if import_anchor not in text:
-                  raise SystemExit("Import anchor not found")
-
               text = text.replace(
-                  import_anchor,
-                  import_anchor
+                  anchor,
+                  anchor
                   + "\nimport androidx.compose.ui.draw.clipToBounds"
                   + "\nimport androidx.compose.ui.graphics.graphicsLayer",
                   1
               )
 
-          # Exact current video block.
+          # Verified against current upstream source.
           start_marker = "        val sessionAspect ="
           end_marker = "        if (showDebugInfo) Box("
 
           start = text.find(start_marker)
           end = text.find(end_marker, start)
 
-          if start == -1:
-              raise SystemExit("Video block start not found")
+          if start < 0:
+              raise SystemExit("START MARKER NOT FOUND")
 
-          if end == -1:
-              raise SystemExit("Video block end not found")
+          if end < 0:
+              raise SystemExit("END MARKER NOT FOUND")
 
-          replacement_lines = [
-              "        // Quest 3 LOCAL right-eye crop.",
-              "        // Quest still sends full 4128x2208 framebuffer.",
-              "        // Crop and rotation happen only on this Android device.",
-              "        // This avoids Quest/Horizon server-side crop flicker.",
+          lines = [
+              "        // Quest 3 local rendering preset",
+              "        // Full 4128x2208 stream stays on Quest.",
+              "        // Right eye is selected locally on Android.",
+              "",
               "        val questEyeAspect = 2064f / 2208f",
               "",
               "        Box(",
@@ -75,18 +72,18 @@ jobs:
               "                .clipToBounds(),",
               "            contentAlignment = Alignment.Center,",
               "        ) {",
+              "",
               "            Box(",
               "                modifier = Modifier",
-              "                    .fillMaxHeight(0.94f)",
+              "                    .fillMaxHeight(0.92f)",
               "                    .aspectRatio(questEyeAspect)",
+              "                    .clipToBounds()",
               "                    .graphicsLayer {",
               "                        rotationZ = -22f",
-              "                        scaleX = 0.78f",
-              "                        scaleY = 0.78f",
-              "                    }",
-              "                    .clipToBounds(),",
+              "                    },",
               "                contentAlignment = Alignment.CenterEnd,",
               "            ) {",
+              "",
               "                ScrcpyVideoSurface(",
               "                    modifier = Modifier",
               "                        .requiredWidth(maxWidth * 2)",
@@ -126,24 +123,23 @@ jobs:
               ""
           ]
 
-          replacement = "\n".join(replacement_lines)
+          replacement = "\n".join(lines)
 
           text = text[:start] + replacement + text[end:]
 
           path.write_text(text, encoding="utf-8")
 
-          print("Quest 3 renderer patch applied")
-          print("Input: full 4128x2208")
-          print("Eye: RIGHT")
-          print("Crop location: Android client")
-          print("Rotation: -22 degrees")
-          print("Server-side crop: DISABLED")
+          print("PATCH OK")
+          print("Right eye")
+          print("Local crop")
+          print("Rotation -22")
+          print("No server crop")
 
       - name: Verify patch
         run: |
           FILE="app/src/main/java/io/github/miuzarte/scrcpyforandroid/pages/FullscreenControlScreen.kt"
 
-          grep -n "Quest 3 LOCAL right-eye crop" "$FILE"
+          grep -n "Quest 3 local rendering preset" "$FILE"
           grep -n "rotationZ = -22f" "$FILE"
           grep -n "requiredWidth(maxWidth \* 2)" "$FILE"
 
@@ -153,24 +149,26 @@ jobs:
       - name: Build APK
         run: ./gradlew assembleDebug
 
-      - name: Find APK
+      - name: Prepare APK
         run: |
-          echo "Available APKs:"
-          find . -type f -name "*.apk" -print
+          echo "Searching APK..."
 
-          APK="$(find app/build/outputs/apk -type f -name "*debug*.apk" | head -n 1)"
+          find app/build/outputs -type f -name "*.apk" -print
+
+          APK="$(find app/build/outputs -type f -name "*debug*.apk" | head -n 1)"
 
           if [ -z "$APK" ]; then
-            echo "Debug APK not found"
+            echo "APK NOT FOUND"
             exit 1
           fi
 
-          cp "$APK" Quest3-ScrcpyForAndroid.apk
-          ls -lh Quest3-ScrcpyForAndroid.apk
+          cp "$APK" Quest3-ScrcpyForAndroid-V2.apk
+
+          ls -lh Quest3-ScrcpyForAndroid-V2.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Quest3-ScrcpyForAndroid-APK
-          path: Quest3-ScrcpyForAndroid.apk
+          name: Quest3-ScrcpyForAndroid-V2
+          path: Quest3-ScrcpyForAndroid-V2.apk
           if-no-files-found: error
