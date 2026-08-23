@@ -1,0 +1,837 @@
+name: Build Quest3 V6 SideQuest View APK
+
+"on":
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Init submodules
+        run: git submodule update --init --recursive
+
+      - name: Replace SurfaceView with Quest TextureView
+        run: |
+          cat > app/src/main/java/io/github/miuzarte/scrcpyforandroid/widgets/ScrcpyInputSurfaceView.kt <<'KOTLIN'
+          package io.github.miuzarte.scrcpyforandroid.widgets
+
+          import android.content.Context
+          import android.graphics.Matrix
+          import android.text.InputType
+          import android.util.AttributeSet
+          import android.view.KeyEvent
+          import android.view.TextureView
+          import android.view.inputmethod.BaseInputConnection
+          import android.view.inputmethod.EditorInfo
+          import android.view.inputmethod.InputConnection
+          import kotlin.math.cos
+          import kotlin.math.sin
+
+          class ScrcpyInputSurfaceView @JvmOverloads constructor(
+              context: Context,
+              attrs: AttributeSet? = null,
+              defStyleAttr: Int = 0,
+          ): TextureView(context, attrs, defStyleAttr) {
+
+              interface InputCallbacks {
+                  fun handleKeyEvent(event: KeyEvent): Boolean
+                  fun handleCommitText(text: CharSequence): Boolean
+                  fun handleDeleteSurroundingText(
+                      beforeLength: Int,
+                      afterLength: Int,
+                  ): Boolean
+              }
+
+              var inputCallbacks: InputCallbacks? = null
+              private var commitTextEnabled = false
+
+              fun setCommitTextEnabled(enabled: Boolean) {
+                  commitTextEnabled = enabled
+                  isFocusable = enabled
+                  isFocusableInTouchMode = enabled
+
+                  if (enabled) {
+                      requestFocus()
+                  } else {
+                      clearFocus()
+                  }
+              }
+
+              /*
+               * Quest 3 framebuffer:
+               *
+               *   4128 x 2208
+               *
+               * SideQuest-style view:
+               *
+               *   crop width  = 1778
+               *   crop height = 1039
+               *   crop x      = 2200
+               *   crop y      = 549
+               *   angle       = -23 degrees
+               *
+               * IMPORTANT:
+               *
+               * We do NOT physically crop the decoded texture first.
+               *
+               * Instead we transform the COMPLETE 4128x2208 texture so
+               * that this crop rectangle fills the TextureView.
+               *
+               * Therefore pixels OUTSIDE the crop are still available
+               * when the image is rotated. This prevents the black
+               * triangles that appear when a cropped bitmap is rotated.
+               *
+               * No --crop is sent to Quest.
+               */
+              fun applyQuest3Transform() {
+                  if (width <= 0 || height <= 0) {
+                      return
+                  }
+
+                  val viewW = width.toFloat()
+                  val viewH = height.toFloat()
+
+                  // Physical Quest framebuffer.
+                  val sourceW = 4128f
+                  val sourceH = 2208f
+
+                  // SideQuest-style crop.
+                  val cropX = 2200f
+                  val cropY = 549f
+                  val cropW = 1778f
+                  val cropH = 1039f
+
+                  // Center of the desired source crop.
+                  val sourceCenterX =
+                      cropX + cropW / 2f
+
+                  val sourceCenterY =
+                      cropY + cropH / 2f
+
+                  /*
+                   * TextureView initially maps the whole source into
+                   * its own coordinate space.
+                   *
+                   * Convert the crop center into TextureView
+                   * coordinates before our custom transform.
+                   */
+                  val centerX =
+                      sourceCenterX / sourceW * viewW
+
+                  val centerY =
+                      sourceCenterY / sourceH * viewH
+
+                  /*
+                   * Scale factors required to make the crop rectangle
+                   * exactly fill the TextureView.
+                   */
+                  val scaleX =
+                      sourceW / cropW
+
+                  val scaleY =
+                      sourceH / cropH
+
+                  /*
+                   * scrcpy preset:
+                   *
+                   * --angle=-23
+                   *
+                   * Android screen coordinates have Y pointing down,
+                   * so the normal 2D rotation matrix produces the same
+                   * visual direction expected here.
+                   */
+                  val angleDegrees = -23f
+
+                  val radians =
+                      Math.toRadians(
+                          angleDegrees.toDouble()
+                      )
+
+                  val c =
+                      cos(radians).toFloat()
+
+                  val s =
+                      sin(radians).toFloat()
+
+                  /*
+                   * Compose:
+                   *
+                   *  1. Translate desired crop center to origin.
+                   *  2. Scale crop to fill view.
+                   *  3. Rotate by -23°.
+                   *  4. Move result to view center.
+                   *
+                   * qx = scaleX * (x - centerX)
+                   * qy = scaleY * (y - centerY)
+                   *
+                   * Then rotate q around the origin.
+                   *
+                   * Because this is one affine transform of the FULL
+                   * texture, content outside the nominal crop remains
+                   * available around the rotated edges.
+                   */
+
+                  val a =
+                      c * scaleX
+
+                  val b =
+                      -s * scaleY
+
+                  val d =
+                      s * scaleX
+
+                  val e =
+                      c * scaleY
+
+                  val tx =
+                      viewW / 2f -
+                          a * centerX -
+                          b * centerY
+
+                  val ty =
+                      viewH / 2f -
+                          d * centerX -
+                          e * centerY
+
+                  val matrix = Matrix()
+
+                  matrix.setValues(
+                      floatArrayOf(
+                          a, b, tx,
+                          d, e, ty,
+                          0f, 0f, 1f,
+                      )
+                  )
+
+                  /*
+                   * TextureView docs explicitly allow transforming
+                   * the underlying SurfaceTexture independently from
+                   * the View bounds.
+                   */
+                  setOpaque(false)
+                  setTransform(matrix)
+              }
+
+              override fun onSizeChanged(
+                  w: Int,
+                  h: Int,
+                  oldw: Int,
+                  oldh: Int,
+              ) {
+                  super.onSizeChanged(
+                      w,
+                      h,
+                      oldw,
+                      oldh,
+                  )
+
+                  if (w > 0 && h > 0) {
+                      post {
+                          applyQuest3Transform()
+                      }
+                  }
+              }
+
+              override fun onCheckIsTextEditor(): Boolean {
+                  return commitTextEnabled ||
+                      super.onCheckIsTextEditor()
+              }
+
+              override fun onKeyPreIme(
+                  keyCode: Int,
+                  event: KeyEvent,
+              ): Boolean {
+                  if (keyCode == KeyEvent.KEYCODE_BACK) {
+                      return super.onKeyPreIme(
+                          keyCode,
+                          event,
+                      )
+                  }
+
+                  if (
+                      inputCallbacks
+                          ?.handleKeyEvent(event) == true
+                  ) {
+                      return true
+                  }
+
+                  return super.onKeyPreIme(
+                      keyCode,
+                      event,
+                  )
+              }
+
+              override fun onCreateInputConnection(
+                  outAttrs: EditorInfo,
+              ): InputConnection? {
+                  if (!commitTextEnabled) {
+                      return super
+                          .onCreateInputConnection(
+                              outAttrs
+                          )
+                  }
+
+                  outAttrs.inputType =
+                      InputType.TYPE_CLASS_TEXT
+
+                  outAttrs.imeOptions =
+                      EditorInfo.IME_FLAG_NO_EXTRACT_UI
+
+                  return object:
+                      BaseInputConnection(
+                          this,
+                          false,
+                      ) {
+
+                      override fun commitText(
+                          text: CharSequence,
+                          newCursorPosition: Int,
+                      ): Boolean {
+                          if (
+                              inputCallbacks
+                                  ?.handleCommitText(
+                                      text
+                                  ) == true
+                          ) {
+                              return true
+                          }
+
+                          return super.commitText(
+                              text,
+                              newCursorPosition,
+                          )
+                      }
+
+                      override fun deleteSurroundingText(
+                          beforeLength: Int,
+                          afterLength: Int,
+                      ): Boolean {
+                          if (
+                              inputCallbacks
+                                  ?.handleDeleteSurroundingText(
+                                      beforeLength,
+                                      afterLength,
+                                  ) == true
+                          ) {
+                              return true
+                          }
+
+                          return super
+                              .deleteSurroundingText(
+                                  beforeLength,
+                                  afterLength,
+                              )
+                      }
+
+                      override fun sendKeyEvent(
+                          event: KeyEvent,
+                      ): Boolean {
+                          if (
+                              event.keyCode ==
+                              KeyEvent.KEYCODE_BACK
+                          ) {
+                              return super
+                                  .sendKeyEvent(event)
+                          }
+
+                          if (
+                              inputCallbacks
+                                  ?.handleKeyEvent(
+                                      event
+                                  ) == true
+                          ) {
+                              return true
+                          }
+
+                          return super.sendKeyEvent(event)
+                      }
+                  }
+              }
+          }
+          KOTLIN
+
+      - name: Patch video output to TextureView
+        shell: python
+        run: |
+          from pathlib import Path
+
+          p = Path(
+              "app/src/main/java/io/github/miuzarte/"
+              "scrcpyforandroid/widgets/DeviceWidgets.kt"
+          )
+
+          s = p.read_text(encoding="utf-8")
+
+          s = s.replace(
+              "import android.view.SurfaceHolder",
+              "import android.graphics.SurfaceTexture\n"
+              "import android.view.TextureView",
+              1,
+          )
+
+          start_marker = (
+              "@Composable\n"
+              "fun ScrcpyVideoSurface("
+          )
+
+          end_marker = (
+              "\n@Composable\n"
+              "internal fun DeviceTile("
+          )
+
+          start = s.find(start_marker)
+          end = s.find(end_marker, start)
+
+          if start < 0:
+              raise SystemExit(
+                  "ScrcpyVideoSurface start not found"
+              )
+
+          if end < 0:
+              raise SystemExit(
+                  "ScrcpyVideoSurface end not found"
+              )
+
+          lines = [
+              "@Composable",
+              "fun ScrcpyVideoSurface(",
+              "    modifier: Modifier,",
+              "    session: Scrcpy.Session.SessionInfo?,",
+              "    imeRequestToken: Int = 0,",
+              "    onImeCommitText: (suspend (String) -> Unit)? = null,",
+              "    onImeDeleteSurroundingText: (suspend (beforeLength: Int, afterLength: Int) -> Unit)? = null,",
+              "    onImeKeyEvent: (suspend (KeyEvent) -> Boolean)? = null,",
+              ") {",
+              "    val taskScope = remember { CoroutineScope(SupervisorJob() + Dispatchers.IO) }",
+              "    val scope = rememberCoroutineScope()",
+              "    val imeInputMutex = remember { Mutex() }",
+              "    val lifecycleOwner = LocalLifecycleOwner.current",
+              "",
+              "    var currentSurface by remember {",
+              "        mutableStateOf<Surface?>(null)",
+              "    }",
+              "",
+              "    var currentTextureView by remember {",
+              "        mutableStateOf<ScrcpyInputSurfaceView?>(null)",
+              "    }",
+              "",
+              "    val latestSession by rememberUpdatedState(session)",
+              "",
+              "    fun configureTexture(",
+              "        view: ScrcpyInputSurfaceView",
+              "    ) {",
+              "        val info = latestSession",
+              "        val texture = view.surfaceTexture",
+              "",
+              "        if (",
+              "            info != null &&",
+              "            texture != null &&",
+              "            info.width > 0 &&",
+              "            info.height > 0",
+              "        ) {",
+              "            texture.setDefaultBufferSize(",
+              "                info.width,",
+              "                info.height,",
+              "            )",
+              "        }",
+              "",
+              "        view.applyQuest3Transform()",
+              "    }",
+              "",
+              "    LaunchedEffect(",
+              "        session,",
+              "        currentSurface,",
+              "    ) {",
+              "        val surface =",
+              "            currentSurface",
+              "                ?: return@LaunchedEffect",
+              "",
+              "        if (",
+              "            session != null &&",
+              "            surface.isValid",
+              "        ) {",
+              "            NativeCoreFacade",
+              "                .attachVideoSurface(surface)",
+              "        }",
+              "    }",
+              "",
+              "    LaunchedEffect(",
+              "        session?.width,",
+              "        session?.height,",
+              "        currentTextureView,",
+              "    ) {",
+              "        currentTextureView",
+              "            ?.let { configureTexture(it) }",
+              "    }",
+              "",
+              "    LaunchedEffect(",
+              "        imeRequestToken,",
+              "        currentTextureView,",
+              "    ) {",
+              "        if (imeRequestToken == 0) {",
+              "            return@LaunchedEffect",
+              "        }",
+              "",
+              "        val view =",
+              "            currentTextureView",
+              "                ?: return@LaunchedEffect",
+              "",
+              "        view.setCommitTextEnabled(true)",
+              "        LocalInputService.showSoftKeyboard(view)",
+              "    }",
+              "",
+              "    DisposableEffect(",
+              "        lifecycleOwner,",
+              "        session,",
+              "        currentSurface,",
+              "    ) {",
+              "        val observer =",
+              "            LifecycleEventObserver { _, event ->",
+              "                if (event == Lifecycle.Event.ON_START) {",
+              "                    val surface = currentSurface",
+              "",
+              "                    if (",
+              "                        session != null &&",
+              "                        surface != null &&",
+              "                        surface.isValid",
+              "                    ) {",
+              "                        scope.launch {",
+              "                            NativeCoreFacade",
+              "                                .attachVideoSurface(surface)",
+              "                        }",
+              "                    }",
+              "                }",
+              "            }",
+              "",
+              "        lifecycleOwner.lifecycle",
+              "            .addObserver(observer)",
+              "",
+              "        onDispose {",
+              "            lifecycleOwner.lifecycle",
+              "                .removeObserver(observer)",
+              "        }",
+              "    }",
+              "",
+              "    DisposableEffect(Unit) {",
+              "        onDispose {",
+              "            val surface = currentSurface",
+              "",
+              "            if (surface != null) {",
+              "                taskScope.launch {",
+              "                    NativeCoreFacade",
+              "                        .detachVideoSurface(surface)",
+              "                    surface.release()",
+              "                }",
+              "            }",
+              "        }",
+              "    }",
+              "",
+              "    AndroidView(",
+              "        modifier = modifier,",
+              "",
+              "        factory = { context ->",
+              "            ScrcpyInputSurfaceView(context).apply {",
+              "                currentTextureView = this",
+              "",
+              "                inputCallbacks =",
+              "                    object:",
+              "                        ScrcpyInputSurfaceView.InputCallbacks {",
+              "",
+              "                        override fun handleKeyEvent(",
+              "                            event: KeyEvent,",
+              "                        ): Boolean {",
+              "                            val handler =",
+              "                                onImeKeyEvent",
+              "                                    ?: return false",
+              "",
+              "                            taskScope.launch {",
+              "                                imeInputMutex.withLock {",
+              "                                    handler(event)",
+              "                                }",
+              "                            }",
+              "",
+              "                            return true",
+              "                        }",
+              "",
+              "                        override fun handleCommitText(",
+              "                            text: CharSequence,",
+              "                        ): Boolean {",
+              "                            val handler =",
+              "                                onImeCommitText",
+              "                                    ?: return false",
+              "",
+              "                            taskScope.launch {",
+              "                                imeInputMutex.withLock {",
+              "                                    handler(text.toString())",
+              "                                }",
+              "                            }",
+              "",
+              "                            return true",
+              "                        }",
+              "",
+              "                        override fun handleDeleteSurroundingText(",
+              "                            beforeLength: Int,",
+              "                            afterLength: Int,",
+              "                        ): Boolean {",
+              "                            val handler =",
+              "                                onImeDeleteSurroundingText",
+              "                                    ?: return false",
+              "",
+              "                            taskScope.launch {",
+              "                                imeInputMutex.withLock {",
+              "                                    handler(",
+              "                                        beforeLength,",
+              "                                        afterLength,",
+              "                                    )",
+              "                                }",
+              "                            }",
+              "",
+              "                            return true",
+              "                        }",
+              "                    }",
+              "",
+              "                surfaceTextureListener =",
+              "                    object:",
+              "                        TextureView.SurfaceTextureListener {",
+              "",
+              "                        override fun onSurfaceTextureAvailable(",
+              "                            surfaceTexture: SurfaceTexture,",
+              "                            width: Int,",
+              "                            height: Int,",
+              "                        ) {",
+              "                            latestSession?.let { info ->",
+              "                                if (",
+              "                                    info.width > 0 &&",
+              "                                    info.height > 0",
+              "                                ) {",
+              "                                    surfaceTexture",
+              "                                        .setDefaultBufferSize(",
+              "                                            info.width,",
+              "                                            info.height,",
+              "                                        )",
+              "                                }",
+              "                            }",
+              "",
+              "                            applyQuest3Transform()",
+              "",
+              "                            val newSurface =",
+              "                                Surface(surfaceTexture)",
+              "",
+              "                            currentSurface = newSurface",
+              "",
+              "                            if (latestSession != null) {",
+              "                                scope.launch {",
+              "                                    NativeCoreFacade",
+              "                                        .attachVideoSurface(",
+              "                                            newSurface",
+              "                                        )",
+              "                                }",
+              "                            }",
+              "                        }",
+              "",
+              "                        override fun onSurfaceTextureSizeChanged(",
+              "                            surfaceTexture: SurfaceTexture,",
+              "                            width: Int,",
+              "                            height: Int,",
+              "                        ) {",
+              "                            applyQuest3Transform()",
+              "                        }",
+              "",
+              "                        override fun onSurfaceTextureDestroyed(",
+              "                            surfaceTexture: SurfaceTexture,",
+              "                        ): Boolean {",
+              "                            val surface = currentSurface",
+              "",
+              "                            if (surface != null) {",
+              "                                taskScope.launch {",
+              "                                    NativeCoreFacade",
+              "                                        .detachVideoSurface(surface)",
+              "                                    surface.release()",
+              "                                }",
+              "",
+              "                                currentSurface = null",
+              "                            }",
+              "",
+              "                            return true",
+              "                        }",
+              "",
+              "                        override fun onSurfaceTextureUpdated(",
+              "                            surfaceTexture: SurfaceTexture,",
+              "                        ) = Unit",
+              "                    }",
+              "            }",
+              "        },",
+              "",
+              "        update = { view ->",
+              "            configureTexture(view)",
+              "        },",
+              "    )",
+              "}",
+          ]
+
+          replacement = "\n".join(lines)
+
+          s = s[:start] + replacement + s[end:]
+
+          p.write_text(
+              s,
+              encoding="utf-8",
+          )
+
+          print(
+              "Quest TextureView renderer installed"
+          )
+
+      - name: Set SideQuest crop aspect ratio
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          # Preview card.
+          p = Path(
+              "app/src/main/java/io/github/miuzarte/"
+              "scrcpyforandroid/widgets/DeviceWidgets.kt"
+          )
+
+          s = p.read_text(encoding="utf-8")
+
+          pattern = re.compile(
+              r"""val sessionAspect =\s*
+              if \(sessionInfo == null \|\| sessionInfo\.height == 0\)\s*
+              16f / 9f\s*
+              else sessionInfo\.width\.toFloat\(\) / sessionInfo\.height\.toFloat\(\)""",
+              re.VERBOSE,
+          )
+
+          s, count = pattern.subn(
+              "val sessionAspect = 1778f / 1039f",
+              s,
+              count=1,
+          )
+
+          if count != 1:
+              raise SystemExit(
+                  "Preview aspect block not found"
+              )
+
+          p.write_text(
+              s,
+              encoding="utf-8",
+          )
+
+          # Fullscreen.
+          p = Path(
+              "app/src/main/java/io/github/miuzarte/"
+              "scrcpyforandroid/pages/FullscreenControlScreen.kt"
+          )
+
+          s = p.read_text(encoding="utf-8")
+
+          pattern = re.compile(
+              r"""val sessionAspect =\s*
+              if \(session\.height == 0\)\s*
+              16f / 9f\s*
+              else session\.width\.toFloat\(\) / session\.height\.toFloat\(\)""",
+              re.VERBOSE,
+          )
+
+          s, count = pattern.subn(
+              "val sessionAspect = 1778f / 1039f",
+              s,
+              count=1,
+          )
+
+          if count != 1:
+              raise SystemExit(
+                  "Fullscreen aspect block not found"
+              )
+
+          p.write_text(
+              s,
+              encoding="utf-8",
+          )
+
+          print(
+              "SideQuest aspect 1778:1039 installed"
+          )
+
+      - name: Verify V6 patch
+        run: |
+          echo "=== SideQuest coordinates ==="
+
+          grep -n "cropX = 2200f" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/widgets/ScrcpyInputSurfaceView.kt
+
+          grep -n "cropY = 549f" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/widgets/ScrcpyInputSurfaceView.kt
+
+          grep -n "cropW = 1778f" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/widgets/ScrcpyInputSurfaceView.kt
+
+          grep -n "cropH = 1039f" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/widgets/ScrcpyInputSurfaceView.kt
+
+          grep -n "angleDegrees = -23f" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/widgets/ScrcpyInputSurfaceView.kt
+
+          echo "=== TextureView ==="
+
+          grep -n "TextureView" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/widgets/ScrcpyInputSurfaceView.kt
+
+          echo "=== Preview aspect ==="
+
+          grep -n "1778f / 1039f" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/widgets/DeviceWidgets.kt
+
+          echo "=== Fullscreen aspect ==="
+
+          grep -n "1778f / 1039f" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/pages/FullscreenControlScreen.kt
+
+      - name: Make Gradle executable
+        run: chmod +x gradlew
+
+      - name: Build APK
+        run: ./gradlew assembleDebug
+
+      - name: Prepare APK
+        run: |
+          APK="$(
+            find app/build/outputs \
+              -type f \
+              -name "*debug*.apk" \
+              | head -n 1
+          )"
+
+          if [ -z "$APK" ]; then
+            echo "APK NOT FOUND"
+            exit 1
+          fi
+
+          cp \
+            "$APK" \
+            Quest3-ScrcpyForAndroid-V6-SideQuest.apk
+
+          ls -lh \
+            Quest3-ScrcpyForAndroid-V6-SideQuest.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Quest3-ScrcpyForAndroid-V6-SideQuest
+          path: Quest3-ScrcpyForAndroid-V6-SideQuest.apk
+          if-no-files-found: error
