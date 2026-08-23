@@ -1,10 +1,10 @@
-name: Build Quest3 Client-Crop APK
+name: Inspect Quest3 Renderer Source
 
 "on":
   workflow_dispatch:
 
 jobs:
-  build:
+  inspect:
     runs-on: ubuntu-latest
 
     steps:
@@ -22,102 +22,13 @@ jobs:
       - name: Init submodules
         run: git submodule update --init --recursive
 
-      - name: Patch Quest 3 renderer
-        shell: python
+      - name: Show FullscreenControlScreen
         run: |
-          from pathlib import Path
+          echo "===== FILE START ====="
+          nl -ba app/src/main/java/io/github/miuzarte/scrcpyforandroid/pages/FullscreenControlScreen.kt
+          echo "===== FILE END ====="
 
-          p = Path("app/src/main/java/io/github/miuzarte/scrcpyforandroid/pages/FullscreenControlScreen.kt")
-          s = p.read_text(encoding="utf-8")
-
-          if "import androidx.compose.ui.draw.clipToBounds" not in s:
-              s = s.replace(
-                  "import androidx.compose.ui.geometry.Offset",
-                  "import androidx.compose.ui.geometry.Offset\nimport androidx.compose.ui.draw.clipToBounds\nimport androidx.compose.ui.graphics.graphicsLayer"
-              )
-
-          start = s.find("        val sessionAspect =")
-          end_marker = "                  onImeCommitText = onImeCommitText,"
-          end = s.find(end_marker, start)
-
-          if start == -1:
-              raise SystemExit("sessionAspect block not found")
-
-          if end == -1:
-              raise SystemExit("ScrcpyVideoSurface block end not found")
-
-          end += len(end_marker)
-
-          lines = [
-              "        // Quest 3 client-side right-eye renderer",
-              "        val questEyeAspect = 2064f / 2208f",
-              "",
-              "        Box(",
-              "            modifier = Modifier",
-              "                .align(Alignment.Center)",
-              "                .fillMaxSize()",
-              "                .clipToBounds(),",
-              "            contentAlignment = Alignment.Center,",
-              "        ) {",
-              "            Box(",
-              "                modifier = Modifier",
-              "                    .fillMaxHeight(0.98f)",
-              "                    .aspectRatio(questEyeAspect)",
-              "                    .graphicsLayer {",
-              "                        rotationZ = -22f",
-              "                        scaleX = 0.78f",
-              "                        scaleY = 0.78f",
-              "                    }",
-              "                    .clipToBounds(),",
-              "            ) {",
-              "                ScrcpyVideoSurface(",
-              "                    modifier = Modifier",
-              "                        .align(Alignment.CenterEnd)",
-              "                        .fillMaxHeight()",
-              "                        .onGloballyPositioned { coordinates ->",
-              "                            val bounds = coordinates.boundsInWindow()",
-              "                            onVideoBoundsInWindowChanged(",
-              "                                Rect(",
-              "                                    bounds.left.toInt(),",
-              "                                    bounds.top.toInt(),",
-              "                                    bounds.right.toInt(),",
-              "                                    bounds.bottom.toInt(),",
-              "                                ),",
-              "                            )",
-              "                        },",
-              "                    session = session,",
-              "                    imeRequestToken = imeRequestToken,",
-              "                    onImeCommitText = onImeCommitText,"
-          ]
-
-          replacement = "\n".join(lines)
-          s = s[:start] + replacement + s[end:]
-
-          p.write_text(s, encoding="utf-8")
-
-          print("Quest 3 renderer patch applied")
-
-      - name: Verify patch
+      - name: Stop intentionally
         run: |
-          grep -n "Quest 3 client-side right-eye renderer" app/src/main/java/io/github/miuzarte/scrcpyforandroid/pages/FullscreenControlScreen.kt
-          grep -n "rotationZ = -22f" app/src/main/java/io/github/miuzarte/scrcpyforandroid/pages/FullscreenControlScreen.kt
-
-      - name: Make Gradle executable
-        run: chmod +x gradlew
-
-      - name: Build APK
-        run: ./gradlew assembleDebug
-
-      - name: Find APK
-        run: |
-          APK="$(find app/build/outputs/apk -type f -name '*debug*.apk' | head -n 1)"
-          test -n "$APK"
-          cp "$APK" Quest3-ScrcpyForAndroid.apk
-          ls -lh Quest3-ScrcpyForAndroid.apk
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: Quest3-ScrcpyForAndroid-APK
-          path: Quest3-ScrcpyForAndroid.apk
-          if-no-files-found: error
+          echo "Inspection complete"
+          exit 1
