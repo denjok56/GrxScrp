@@ -1,0 +1,916 @@
+name: Build Quest3 V7.1 FlatCast APK
+
+"on":
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Init submodules
+        run: git submodule update --init --recursive
+
+      - name: Add Quest flat-view agent
+        run: |
+          mkdir -p app/src/main/assets
+          curl -L --fail \
+            https://raw.githubusercontent.com/xAstroBoy/quest-scrcpy/main/assets/quest-flat-agent.jar \
+            -o app/src/main/assets/quest-flat-agent.jar
+
+          test -s app/src/main/assets/quest-flat-agent.jar
+          test "$(stat -c%s app/src/main/assets/quest-flat-agent.jar)" -gt 1000
+
+          curl -L --fail \
+            https://raw.githubusercontent.com/xAstroBoy/quest-scrcpy/main/LICENSE \
+            -o app/src/main/assets/QUEST_SCRCPY_LICENSE.txt
+
+          ls -lh app/src/main/assets/quest-flat-agent.jar
+
+      - name: Add FlatCast controller
+        run: |
+          cat > app/src/main/java/io/github/miuzarte/scrcpyforandroid/nativecore/QuestFlatStreamController.kt <<'KOTLIN'
+          package io.github.miuzarte.scrcpyforandroid.nativecore
+
+          import android.content.Context
+          import android.util.Log
+          import android.view.Surface
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.Job
+          import kotlinx.coroutines.SupervisorJob
+          import kotlinx.coroutines.cancelAndJoin
+          import kotlinx.coroutines.currentCoroutineContext
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.isActive
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.sync.Mutex
+          import kotlinx.coroutines.sync.withLock
+          import java.io.EOFException
+          import java.io.InputStream
+
+          object QuestFlatStreamController {
+              private const val TAG = "QuestFlatCast"
+
+              private const val REMOTE_AGENT =
+                  "/data/local/tmp/quest-flat-agent.jar"
+
+              private const val AGENT_MAIN =
+                  "com.questflat.FlatStream"
+
+              private const val TARGET_WIDTH = 1920
+              private const val TARGET_HEIGHT = 1080
+              private const val TARGET_BITRATE = 20_000_000
+              private const val TARGET_FPS = 60
+
+              private val scope =
+                  CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+              private val mutex = Mutex()
+
+              private var currentSurface: Surface? = null
+              private var stream: AdbSocketStream? = null
+              private var decoder: MediaCodecVideoDecoder? = null
+              private var streamJob: Job? = null
+              private var delayedStopJob: Job? = null
+
+              suspend fun attach(
+                  context: Context,
+                  surface: Surface,
+              ) {
+                  if (!surface.isValid) {
+                      Log.w(TAG, "attach(): invalid surface")
+                      return
+                  }
+
+                  mutex.withLock {
+                      delayedStopJob?.cancel()
+                      delayedStopJob = null
+
+                      currentSurface = surface
+
+                      val existingDecoder = decoder
+                      val existingJob = streamJob
+
+                      if (
+                          existingJob?.isActive == true &&
+                          existingDecoder?.isUsable() == true
+                      ) {
+                          if (existingDecoder.switchOutputSurface(surface)) {
+                              Log.i(TAG, "attach(): switched decoder surface")
+                              return
+                          }
+
+                          Log.w(
+                              TAG,
+                              "attach(): surface switch failed; restarting stream",
+                          )
+                      }
+
+                      stopLocked()
+
+                      currentSurface = surface
+
+                      val appContext = context.applicationContext
+
+                      streamJob = scope.launch {
+                          runFlatStream(
+                              context = appContext,
+                              expectedSurface = surface,
+                          )
+                      }
+                  }
+              }
+
+              suspend fun detach(surface: Surface) {
+                  mutex.withLock {
+                      if (currentSurface !== surface) {
+                          return
+                      }
+
+                      currentSurface = null
+
+                      delayedStopJob?.cancel()
+                      delayedStopJob = scope.launch {
+                          delay(900)
+
+                          mutex.withLock {
+                              if (currentSurface == null) {
+                                  Log.i(
+                                      TAG,
+                                      "detach(): no replacement surface; stopping",
+                                  )
+                                  stopLocked()
+                              }
+                          }
+                      }
+                  }
+              }
+
+              suspend fun stop() {
+                  mutex.withLock {
+                      currentSurface = null
+                      delayedStopJob?.cancel()
+                      delayedStopJob = null
+                      stopLocked()
+                  }
+
+                  runCatching {
+                      NativeAdbService.shell(
+                          "pkill -f '[c]om.questflat.FlatStream' >/dev/null 2>&1 || true"
+                      )
+                  }
+              }
+
+              private suspend fun runFlatStream(
+                  context: Context,
+                  expectedSurface: Surface,
+              ) {
+                  var localStream: AdbSocketStream? = null
+                  var localDecoder: MediaCodecVideoDecoder? = null
+
+                  try {
+                      runCatching {
+                          NativeAdbService.shell(
+                              "pkill -f '[c]om.questflat.FlatStream' >/dev/null 2>&1 || true"
+                          )
+                      }
+
+                      delay(300)
+
+                      context.assets
+                          .open("quest-flat-agent.jar")
+                          .use { input ->
+                              NativeAdbService.push(
+                                  input = input,
+                                  remotePath = REMOTE_AGENT,
+                              )
+                          }
+
+                      val command =
+                          "CLASSPATH=$REMOTE_AGENT " +
+                              "app_process /system/bin $AGENT_MAIN " +
+                              "-w $TARGET_WIDTH " +
+                              "-h $TARGET_HEIGHT " +
+                              "-b $TARGET_BITRATE " +
+                              "-f $TARGET_FPS " +
+                              "-a 0"
+
+                      Log.i(TAG, "launching flat agent: $command")
+
+                      localStream =
+                          NativeAdbService.openShellStream(command)
+
+                      mutex.withLock {
+                          if (currentSurface !== expectedSurface) {
+                              localStream?.close()
+                              return
+                          }
+
+                          stream = localStream
+                      }
+
+                      val input =
+                          localStream?.inputStream
+                              ?: throw EOFException(
+                                  "flat agent stream has no input"
+                              )
+
+                      val dimensions = readHeader(input)
+                      val width = dimensions.first
+                      val height = dimensions.second
+
+                      Log.i(
+                          TAG,
+                          "flat stream header: ${width}x${height}",
+                      )
+
+                      localDecoder = MediaCodecVideoDecoder(
+                          width = width,
+                          height = height,
+                          outputSurface = expectedSurface,
+                          mimeType = "video/avc",
+                          onOutputSizeChanged = { w, h ->
+                              Log.i(
+                                  TAG,
+                                  "decoder output size: ${w}x${h}",
+                              )
+                          },
+                          onFpsUpdated = { fps ->
+                              Log.d(
+                                  TAG,
+                                  "decoder fps=${"%.1f".format(fps)}",
+                              )
+                          },
+                      )
+
+                      mutex.withLock {
+                          if (currentSurface !== expectedSurface) {
+                              localDecoder?.release()
+                              localStream?.close()
+                              return
+                          }
+
+                          decoder = localDecoder
+                      }
+
+                      var frameIndex = 0L
+
+                      while (currentCoroutineContext().isActive) {
+                          val kind = input.read()
+
+                          if (kind < 0) {
+                              throw EOFException(
+                                  "flat agent stream ended"
+                              )
+                          }
+
+                          val length = readIntBe(input)
+
+                          if (
+                              length <= 0 ||
+                              length > 64_000_000
+                          ) {
+                              throw IllegalStateException(
+                                  "invalid flat packet length=$length"
+                              )
+                          }
+
+                          val data = ByteArray(length)
+                          readFully(input, data)
+
+                          if (kind != 0) {
+                              continue
+                          }
+
+                          val nalTypes = h264NalTypes(data)
+                          val isKeyFrame = 5 in nalTypes
+                          val isConfig =
+                              (7 in nalTypes || 8 in nalTypes) &&
+                                  1 !in nalTypes &&
+                                  5 !in nalTypes
+
+                          val ptsUs =
+                              (frameIndex * 1_000_000L) /
+                                  TARGET_FPS
+
+                          localDecoder?.feedAnnexB(
+                              data = data,
+                              ptsUs = ptsUs,
+                              isKeyFrame = isKeyFrame,
+                              isConfig = isConfig,
+                          )
+
+                          if (!isConfig) {
+                              frameIndex += 1
+                          }
+
+                          if (
+                              localDecoder?.isUsable() == false
+                          ) {
+                              throw IllegalStateException(
+                                  "MediaCodec decoder became unusable"
+                              )
+                          }
+                      }
+                  } catch (error: Throwable) {
+                      if (currentCoroutineContext().isActive) {
+                          Log.e(
+                              TAG,
+                              "flat stream failed",
+                              error,
+                          )
+                      }
+                  } finally {
+                      runCatching {
+                          localDecoder?.release()
+                      }
+
+                      runCatching {
+                          localStream?.close()
+                      }
+
+                      mutex.withLock {
+                          if (decoder === localDecoder) {
+                              decoder = null
+                          }
+
+                          if (stream === localStream) {
+                              stream = null
+                          }
+
+                          if (
+                              streamJob ===
+                              currentCoroutineContext()[Job]
+                          ) {
+                              streamJob = null
+                          }
+                      }
+
+                      Log.i(TAG, "flat stream worker finished")
+                  }
+              }
+
+              private fun readHeader(
+                  input: InputStream,
+              ): Pair<Int, Int> {
+                  val magic =
+                      byteArrayOf(
+                          'Q'.code.toByte(),
+                          'F'.code.toByte(),
+                          'L'.code.toByte(),
+                          'T'.code.toByte(),
+                      )
+
+                  val window = ByteArray(4)
+                  var scanned = 0
+
+                  while (true) {
+                      val value = input.read()
+
+                      if (value < 0) {
+                          throw EOFException(
+                              "EOF while waiting for QFLT"
+                          )
+                      }
+
+                      window[0] = window[1]
+                      window[1] = window[2]
+                      window[2] = window[3]
+                      window[3] = value.toByte()
+
+                      scanned += 1
+
+                      if (window.contentEquals(magic)) {
+                          break
+                      }
+
+                      if (scanned > 65_536) {
+                          throw IllegalStateException(
+                              "QFLT magic not found"
+                          )
+                      }
+                  }
+
+                  val width = readIntBe(input)
+                  val height = readIntBe(input)
+
+                  if (
+                      width !in 1..8192 ||
+                      height !in 1..8192
+                  ) {
+                      throw IllegalStateException(
+                          "invalid flat dimensions ${width}x${height}"
+                      )
+                  }
+
+                  return width to height
+              }
+
+              private fun readIntBe(
+                  input: InputStream,
+              ): Int {
+                  val b0 = input.read()
+                  val b1 = input.read()
+                  val b2 = input.read()
+                  val b3 = input.read()
+
+                  if (
+                      b0 < 0 ||
+                      b1 < 0 ||
+                      b2 < 0 ||
+                      b3 < 0
+                  ) {
+                      throw EOFException(
+                          "EOF while reading big-endian int"
+                      )
+                  }
+
+                  return (
+                      (b0 shl 24) or
+                          (b1 shl 16) or
+                          (b2 shl 8) or
+                          b3
+                      )
+              }
+
+              private fun readFully(
+                  input: InputStream,
+                  target: ByteArray,
+              ) {
+                  var offset = 0
+
+                  while (offset < target.size) {
+                      val count =
+                          input.read(
+                              target,
+                              offset,
+                              target.size - offset,
+                          )
+
+                      if (count < 0) {
+                          throw EOFException(
+                              "EOF while reading flat packet"
+                          )
+                      }
+
+                      offset += count
+                  }
+              }
+
+              private fun h264NalTypes(
+                  data: ByteArray,
+              ): Set<Int> {
+                  val result = linkedSetOf<Int>()
+                  var i = 0
+
+                  while (i + 4 < data.size) {
+                      var startCodeSize = 0
+
+                      if (
+                          data[i] == 0.toByte() &&
+                          data[i + 1] == 0.toByte() &&
+                          data[i + 2] == 1.toByte()
+                      ) {
+                          startCodeSize = 3
+                      } else if (
+                          i + 4 < data.size &&
+                          data[i] == 0.toByte() &&
+                          data[i + 1] == 0.toByte() &&
+                          data[i + 2] == 0.toByte() &&
+                          data[i + 3] == 1.toByte()
+                      ) {
+                          startCodeSize = 4
+                      }
+
+                      if (
+                          startCodeSize > 0 &&
+                          i + startCodeSize < data.size
+                      ) {
+                          val nal =
+                              data[i + startCodeSize]
+                                  .toInt() and 0x1F
+
+                          result += nal
+                          i += startCodeSize + 1
+                      } else {
+                          i += 1
+                      }
+                  }
+
+                  return result
+              }
+
+              private suspend fun stopLocked() {
+                  delayedStopJob?.cancel()
+                  delayedStopJob = null
+
+                  val job = streamJob
+                  streamJob = null
+
+                  runCatching {
+                      stream?.close()
+                  }
+                  stream = null
+
+                  runCatching {
+                      decoder?.release()
+                  }
+                  decoder = null
+
+                  if (
+                      job != null &&
+                      job !== currentCoroutineContext()[Job]
+                  ) {
+                      job.cancel()
+                  }
+              }
+          }
+          KOTLIN
+
+      - name: Patch scrcpy session to control-only
+        shell: python
+        run: |
+          from pathlib import Path
+
+          p = Path(
+              "app/src/main/java/io/github/miuzarte/"
+              "scrcpyforandroid/scrcpy/Scrcpy.kt"
+          )
+
+          s = p.read_text(encoding="utf-8")
+
+          start = s.find(
+              "suspend fun start(options: ClientOptions)"
+          )
+
+          end = s.find(
+              "suspend fun stop(",
+              start,
+          )
+
+          if start < 0 or end < 0:
+              raise SystemExit(
+                  "Scrcpy.start block not found"
+              )
+
+          block = s[start:end]
+
+          if "options.validate()" not in block:
+              raise SystemExit(
+                  "options.validate() not found"
+              )
+
+          block = block.replace(
+              "options = options,",
+              "options = effectiveOptions,",
+              1,
+          )
+
+          block = block.replace(
+              "options.",
+              "effectiveOptions.",
+          )
+
+          block = block.replace(
+              "RecordingFileResolver.resolve(options, info)",
+              "RecordingFileResolver.resolve(effectiveOptions, info)",
+          )
+
+          block = block.replace(
+              "this@Scrcpy, options)",
+              "this@Scrcpy, effectiveOptions)",
+          )
+
+          block = block.replace(
+              "effectiveOptions.validate()",
+              """val effectiveOptions = options.copy(
+                  video = false,
+                  audio = false,
+                  control = true,
+              )
+              effectiveOptions.validate()""",
+              1,
+          )
+
+          s = s[:start] + block + s[end:]
+
+          p.write_text(
+              s,
+              encoding="utf-8",
+          )
+
+          print(
+              "scrcpy server patched to control-only"
+          )
+
+      - name: Patch video Surface to FlatCast
+        shell: python
+        run: |
+          from pathlib import Path
+
+          p = Path(
+              "app/src/main/java/io/github/miuzarte/"
+              "scrcpyforandroid/widgets/DeviceWidgets.kt"
+          )
+
+          s = p.read_text(encoding="utf-8")
+
+          quest_import = (
+              "import io.github.miuzarte.scrcpyforandroid."
+              "nativecore.QuestFlatStreamController"
+          )
+
+          if quest_import not in s:
+              # DeviceWidgets currently imports NativeCoreFacade from the root
+              # package, but does not import NativeAdbService. Insert next to
+              # the stable NativeCoreFacade import instead.
+              anchor = (
+                  "import io.github.miuzarte.scrcpyforandroid."
+                  "NativeCoreFacade"
+              )
+
+              if anchor not in s:
+                  raise SystemExit(
+                      "NativeCoreFacade import anchor not found"
+                  )
+
+              s = s.replace(
+                  anchor,
+                  anchor + "\n" + quest_import,
+                  1,
+              )
+
+          context_import = (
+              "import androidx.compose.ui.platform.LocalContext"
+          )
+
+          if context_import not in s:
+              # LocalLifecycleOwner is from androidx.lifecycle.compose in this
+              # revision, so use the stable LocalHapticFeedback import.
+              anchor = (
+                  "import androidx.compose.ui.platform."
+                  "LocalHapticFeedback"
+              )
+
+              if anchor not in s:
+                  raise SystemExit(
+                      "LocalHapticFeedback import anchor not found"
+                  )
+
+              s = s.replace(
+                  anchor,
+                  anchor + "\n" + context_import,
+                  1,
+              )
+
+          start = s.find(
+              "@Composable\nfun ScrcpyVideoSurface("
+          )
+
+          end = s.find(
+              "\n@Composable\ninternal fun DeviceTile(",
+              start,
+          )
+
+          if start < 0 or end < 0:
+              raise SystemExit(
+                  "ScrcpyVideoSurface block not found"
+              )
+
+          block = s[start:end]
+
+          scope_line = (
+              "    val scope = rememberCoroutineScope()"
+          )
+
+          if scope_line not in block:
+              raise SystemExit(
+                  "scope line not found"
+              )
+
+          block = block.replace(
+              scope_line,
+              scope_line
+              + "\n"
+              + "    val context = "
+              + "LocalContext.current.applicationContext",
+              1,
+          )
+
+          latest_line = (
+              "    val latestSession by "
+              "rememberUpdatedState(session)"
+          )
+
+          if latest_line not in block:
+              raise SystemExit(
+                  "latestSession line not found"
+              )
+
+          block = block.replace(
+              latest_line,
+              latest_line
+              + "\n\n"
+              + "    LaunchedEffect(session) {\n"
+              + "        if (session == null) {\n"
+              + "            QuestFlatStreamController.stop()\n"
+              + "        }\n"
+              + "    }",
+              1,
+          )
+
+          block = block.replace(
+              "holder.setFixedSize(session.width, session.height)",
+              "holder.setFixedSize(1920, 1080)",
+          )
+
+          block = block.replace(
+              "NativeCoreFacade.attachVideoSurface(",
+              "QuestFlatStreamController.attach(context, ",
+          )
+
+          block = block.replace(
+              "NativeCoreFacade.detachVideoSurface(",
+              "QuestFlatStreamController.detach(",
+          )
+
+          if (
+              "QuestFlatStreamController.attach"
+              not in block
+          ):
+              raise SystemExit(
+                  "FlatCast attach patch failed"
+              )
+
+          s = s[:start] + block + s[end:]
+
+          p.write_text(
+              s,
+              encoding="utf-8",
+          )
+
+          print(
+              "video Surface patched to Quest FlatCast"
+          )
+
+      - name: Patch preview and fullscreen to 16:9
+        shell: python
+        run: |
+          from pathlib import Path
+
+          # Preview
+          p = Path(
+              "app/src/main/java/io/github/miuzarte/"
+              "scrcpyforandroid/widgets/DeviceWidgets.kt"
+          )
+
+          s = p.read_text(encoding="utf-8")
+
+          preview_fn = s.find(
+              "internal fun PreviewCard("
+          )
+
+          preview_start = s.find(
+              "                val sessionAspect =",
+              preview_fn,
+          )
+
+          preview_end = s.find(
+              "                val containerAspect =",
+              preview_start,
+          )
+
+          if (
+              preview_fn < 0 or
+              preview_start < 0 or
+              preview_end < 0
+          ):
+              raise SystemExit(
+                  "preview aspect block not found"
+              )
+
+          s = (
+              s[:preview_start]
+              + "                val sessionAspect = 16f / 9f\n"
+              + s[preview_end:]
+          )
+
+          p.write_text(
+              s,
+              encoding="utf-8",
+          )
+
+          # Fullscreen
+          p = Path(
+              "app/src/main/java/io/github/miuzarte/"
+              "scrcpyforandroid/pages/FullscreenControlScreen.kt"
+          )
+
+          s = p.read_text(encoding="utf-8")
+
+          fullscreen_start = s.find(
+              "        val sessionAspect ="
+          )
+
+          fullscreen_end = s.find(
+              "        Box(",
+              fullscreen_start,
+          )
+
+          if (
+              fullscreen_start < 0 or
+              fullscreen_end < 0
+          ):
+              raise SystemExit(
+                  "fullscreen aspect block not found"
+              )
+
+          s = (
+              s[:fullscreen_start]
+              + "        val sessionAspect = 16f / 9f\n"
+              + s[fullscreen_end:]
+          )
+
+          p.write_text(
+              s,
+              encoding="utf-8",
+          )
+
+          print(
+              "FlatCast aspect patched to 16:9"
+          )
+
+      - name: Verify V7 FlatCast patch
+        run: |
+          echo "=== Agent ==="
+          test -s app/src/main/assets/quest-flat-agent.jar
+          ls -lh app/src/main/assets/quest-flat-agent.jar
+
+          echo "=== Controller ==="
+          grep -n "TARGET_WIDTH = 1920" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/nativecore/QuestFlatStreamController.kt
+          grep -n "QFLT" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/nativecore/QuestFlatStreamController.kt
+          grep -n "feedAnnexB" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/nativecore/QuestFlatStreamController.kt
+
+          echo "=== Control-only scrcpy ==="
+          grep -n "video = false" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/scrcpy/Scrcpy.kt
+          grep -n "control = true" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/scrcpy/Scrcpy.kt
+
+          echo "=== Surface uses FlatCast ==="
+          grep -n "QuestFlatStreamController.attach" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/widgets/DeviceWidgets.kt
+
+          echo "=== 16:9 ==="
+          grep -n "sessionAspect = 16f / 9f" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/widgets/DeviceWidgets.kt
+          grep -n "sessionAspect = 16f / 9f" \
+            app/src/main/java/io/github/miuzarte/scrcpyforandroid/pages/FullscreenControlScreen.kt
+
+      - name: Make Gradle executable
+        run: chmod +x gradlew
+
+      - name: Build APK
+        run: ./gradlew assembleDebug
+
+      - name: Prepare APK
+        run: |
+          APK="$(
+            find app/build/outputs \
+              -type f \
+              -name "*debug*.apk" \
+              | head -n 1
+          )"
+
+          if [ -z "$APK" ]; then
+            echo "APK NOT FOUND"
+            exit 1
+          fi
+
+          cp \
+            "$APK" \
+            Quest3-FlatCast-V71.apk
+
+          ls -lh Quest3-FlatCast-V71.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Quest3-FlatCast-V71
+          path: Quest3-FlatCast-V71.apk
+          if-no-files-found: error
